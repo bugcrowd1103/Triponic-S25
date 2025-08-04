@@ -1,2 +1,1 @@
-# Triponic-S25
-Triponic-S25
+# TripPlanner
