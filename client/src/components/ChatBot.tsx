@@ -1,7 +1,6 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import TypingIndicator from "@/components/chatbot/components/TypingIndicator";
 import TripPlanMessage from "@/components/chatbot/components/TripPlanMessage";
-import { useLocation } from "wouter";
 import { marked } from "marked";
 
 const API_KEY = "AIzaSyCwk1tay6gpqlVy7SHuA5Iv3lzRb9ENsvY";
@@ -24,15 +23,16 @@ const ChatBot = ({
         "Looking for adventure ideas",
         "Help me find flights",
       ],
-
       type: "text",
     },
   ]);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
+  const [recording, setRecording] = useState(false);
   const chatRef = useRef(null);
 
-  const chatIdRef = useRef<string | null>(null);
+  const chatIdRef = useRef(null);
+  const abortControllerRef = useRef(null);
 
   useEffect(() => {
     if (initialInput && initialInput.trim() !== "") {
@@ -58,20 +58,47 @@ const ChatBot = ({
     }
   }, [messages]);
 
-  const callGemini = async (userMessage: string, messages: any[]) => {
+  // Text-to-Speech function
+  const speak = (text) => {
+    if ("speechSynthesis" in window) {
+      const speech = new SpeechSynthesisUtterance(text);
+      speech.lang = "en-US";
+      speech.volume = 1;
+      speech.rate = 1;
+      speech.pitch = 1;
+
+      const voices = window.speechSynthesis.getVoices();
+      const preferredVoice = voices.find(voice => voice.name === "Google US English");
+      if (preferredVoice) {
+        speech.voice = preferredVoice;
+      }
+      window.speechSynthesis.speak(speech);
+    } else {
+      console.log("Text-to-speech not supported in this browser.");
+    }
+  };
+
+  // Renamed to callTono
+  const callTono = async (userMessage, messages) => {
+    // Abort previous request if any
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+    }
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
+
     try {
-      // Format current chat messages into conversation history string
       const conversationHistory = messages
         .map((msg) => {
           const senderLabel = msg.sender === "user" ? "User" : "AI";
           const text =
-            msg.type === "tripPlan" ? msg.content || msg.text : msg.text;
+            msg.type === "tripPlan" ? JSON.stringify(msg.detailedPlan) : msg.text;
           return `${senderLabel}: ${text}`;
         })
         .join("\n");
 
-      const prompt = `You are an AI travel planner.
-      If the user is casually chatting or hasn't provided all necessary trip info, you can talk normally — but always guide the conversation back by kindly asking how you can help them with their travel plans.
+      const prompt = `You are Tono, an AI travel planner.
+If the user is casually chatting or hasn't provided all necessary trip info, you can talk normally — but always guide the conversation back by kindly asking how you can help them with their travel plans.
 
 If the user hasn't provided all key trip details, ask ONLY the missing ones — very briefly and directly, in 1 short sentence per question. DO NOT explain anything or add extra text.
 
@@ -79,11 +106,11 @@ If the user hasn't provided all key trip details, ask ONLY the missing ones — 
 - Travel dates or duration of the trip
 - Number of travelers
 - Budget
-- Interests or preferred activities (e.g., adventure, relaxation, food, culture)
+- Interests or preferred activities (optional: only ask if the user seems interested or if it would improve the plan)
 
 Only once the user has provided all required details, generate a concise full trip itinerary with the following info:
 
-this is user what said previusly ${conversationHistory}
+this is what the user said previously: ${conversationHistory}
 
 ✈️ Flight details: departure city, destination, airline, flight time, price, and duration.
 🏨 Hotel details: name, location, price per night, rating, and key amenities.
@@ -99,12 +126,12 @@ Return ONLY a valid JSON object matching this exact structure (no explanations, 
   "content": "string with a sweet message about the trip and destination",
   "detailedPlan": {
     "destination": "string"(required),
-    "description": "string(required a swwet desiton for the place)",
+    "description": "string (required, a sweet description for the place)",
     "thumbnail": "string with a famous landmark or place name",
     "duration": "string"(required),
     "travelers": number(required),
     "budget": "string"(required),
-    "interest": "string"(required),
+    "interest": "string"(optional),
     "totalCost": "string",
     "flights": {
       "departure": "string",
@@ -119,40 +146,44 @@ Return ONLY a valid JSON object matching this exact structure (no explanations, 
       "rating": number,
       "amenities": ["string"]
     },
-   "dailyPlan": [
-  {
-    "day": number,
-    "title": "string",
-    "description": "string",
-    "activities": ["string", "string", "..."],
-    "activitiesDescription": ["string", "string", "..."],
-    "travelTips": ["string", "string", "..."],
-    "meals": {
-      "breakfast": "string",
-      "lunch": "string",
-      "dinner": "string"
-    },
-    "notes": "string",
-    "image": "string",
-    "weather": "string",
-    "transport": "string"
-  }
-]
-,
+    "dailyPlan": [
+      {
+        "day": number,
+        "title": "string",
+        "description": "string",
+        "activities": ["string", "string", "..."],
+        "activitiesDescription": ["string", "string", "..."],
+        "travelTips": ["string", "string", "..."],
+        "meals": {
+          "breakfast": "string",
+          "lunch": "string",
+          "dinner": "string"
+        },
+        "notes": "string",
+        "image": "string",
+        "weather": "string",
+        "transport": "string"
+      }
+    ],
     "weather": {
       "temp": "string",
       "condition": "string",
       "recommendation": "string"
     }
   },
-  "suggestions": ["string", "string", "..."(per suggestion make it short and concise)],
+  "suggestions": ["string", "string", "..."]
 }
 
 User input:
 ${userMessage}
-    `.trim();
+      `.trim();
 
-      const response = await fetch(
+      // Set a timeout for fetch (15 seconds)
+      const timeoutPromise = new Promise((_, reject) =>
+        setTimeout(() => reject(new Error("Request timed out")), 15000)
+      );
+
+      const fetchPromise = fetch(
         `https://generativelanguage.googleapis.com/v1/models/gemini-2.5-pro:generateContent?key=${API_KEY}`,
         {
           method: "POST",
@@ -165,38 +196,33 @@ ${userMessage}
               },
             ],
           }),
+          signal: controller.signal,
         }
-      );
+      ).then((response) => response.json());
 
-      const data = await response.json();
+      const data = await Promise.race([fetchPromise, timeoutPromise]);
       const textResponse = data?.candidates?.[0]?.content?.parts?.[0]?.text;
 
       if (!textResponse) {
-        return { error: "No response from Gemini." };
+        return { error: "No response from Tono." };
       }
 
-      // Try to parse JSON response from Gemini (handle double-stringified JSON)
       try {
         let cleanText = textResponse.trim();
 
-        // Remove Markdown code block (```json\n...\n```)
         if (cleanText.startsWith("```json") || cleanText.startsWith("```")) {
           cleanText = cleanText.replace(/^```json\n?/, "").replace(/```$/, "");
         }
 
-        // Try parsing cleaned string
         let parsed = JSON.parse(cleanText);
 
-        // If parsed is a string, parse again (handle double JSON)
         if (typeof parsed === "string") {
           parsed = JSON.parse(parsed);
         }
 
-        // Confirm parsed is an object with content and detailedPlan keys
         if (parsed && parsed.content && parsed.detailedPlan) {
           return parsed;
         } else {
-          // Sometimes the API returns an object wrapped in a 'choices' or another key - adjust if needed
           return {
             error: "Parsed JSON does not have expected keys.",
             raw: textResponse,
@@ -204,81 +230,116 @@ ${userMessage}
         }
       } catch (e) {
         return {
-          error: "Failed to parse Gemini response as JSON.",
+          error: "Failed to parse Tono response as JSON.",
           raw: textResponse,
         };
       }
     } catch (error) {
-      console.error("Gemini API Error:", error);
-      return { error: "Could not connect to Gemini." };
+      if (error.name === "AbortError") {
+        return { error: "Request was cancelled." };
+      }
+      return { error: error.message || "Could not connect to Tono." };
     }
   };
-  const handleInputSubmit = async (inputValue?: string) => {
+
+  // useCallback to avoid stale closure in useEffect
+  const handleInputSubmit = useCallback(async (inputValue) => {
     const userText = (inputValue ?? input).trim();
     if (!userText || loading) return;
 
-    // Clear input only if inputValue is undefined (user typing)
     if (!inputValue) setInput("");
 
-    // Add user message first using functional update to get latest messages
-    setMessages((prevMessages) => {
-      const newMessages = [
-        ...prevMessages,
-        { sender: "user", text: userText, type: "text" },
-      ];
+    // Add user message immediately
+    const userMessage = { sender: "user", text: userText, type: "text" };
+    setMessages((prevMessages) => [...prevMessages, userMessage]);
 
-      (async () => {
-        setLoading(true);
+    setLoading(true);
 
-        const botResponse = await callGemini(userText, newMessages);
+    // Call Tono with the full updated message history
+    const botResponse = await callTono(userText, [...messages, userMessage]);
 
-        setLoading(false);
+    setLoading(false);
 
-        const uniqueId = Date.now().toString(); // message id
-        const planId = `plan-${uniqueId}`; // your custom plan ID
-        const chatId = chatIdRef.current || "default-chat";
+    // Prepare bot message
+    const uniqueId = Date.now().toString();
+    const planId = `plan-${uniqueId}`;
+    const chatId = chatIdRef.current || "default-chat";
 
-        const botMessage = {
-          sender: "bot",
-          id: uniqueId,
-          plan_id: planId,
-          ...botResponse,
-          type: "tripPlan",
-        };
+    const botMessage = {
+      sender: "bot",
+      id: uniqueId,
+      plan_id: planId,
+      ...botResponse,
+      type: "tripPlan", // Assuming a tripPlan is always the response
+      // Fallback if tripPlan isn't generated
+      text: botResponse?.error || botResponse?.content,
+    };
 
-        // Update messages with bot response
-        setMessages((prev) => [...prev, botMessage]);
+    // Update messages with bot response
+    setMessages((prev) => [...prev, botMessage]);
 
-        // Save chat history to localStorage
-        const historyKey = `chatHistory-${planId}`;
-        const existing = JSON.parse(localStorage.getItem(historyKey) || "[]");
+    // Save chat history to localStorage
+    const historyKey = `chatHistory-${chatId}`; // Use chatId for history
+    const existing = JSON.parse(localStorage.getItem(historyKey) || "[]");
+    const newEntry = {
+      id: uniqueId,
+      plan_id: planId,
+      timestamp: new Date().toISOString(),
+      userPrompt: userText,
+      tonoResponse: botResponse,
+    };
+    localStorage.setItem(historyKey, JSON.stringify([...existing, newEntry]));
 
-        const newEntry = {
-          id: uniqueId,
-          plan_id: planId,
-          timestamp: new Date().toISOString(),
-          userPrompt: userText,
-          geminiResponse: botResponse,
-        };
+    // Speak the bot's response if it has a text property
+    if (botMessage.text) {
+      speak(botMessage.text);
+    }
+  }, [input, loading, messages]);
 
-        localStorage.setItem(
-          historyKey,
-          JSON.stringify([...existing, newEntry])
-        );
-      })();
+  // Speech-to-Text function
+  const handleMicClick = () => {
+    // Support both standard and webkit SpeechRecognition
+    const SpeechRecognition =
+      window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SpeechRecognition) {
+      alert("Speech recognition not supported in this browser.");
+      return;
+    }
+    const recognition = new SpeechRecognition();
+    recognition.lang = "en-US";
+    recognition.interimResults = false;
+    recognition.maxAlternatives = 1;
 
-      return newMessages;
-    });
+    setRecording(true);
+
+    recognition.onresult = (event) => {
+      const transcript = event.results[0][0].transcript;
+      setInput((prev) => (prev ? prev + " " : "") + transcript);
+      setRecording(false);
+    };
+    recognition.onerror = () => {
+      setRecording(false);
+    };
+    recognition.onend = () => {
+      setRecording(false);
+    };
+    recognition.start();
   };
+
+  useEffect(() => {
+    if (initialInput && initialInput.trim() !== "") {
+      handleInputSubmit(initialInput);
+    }
+  }, [initialInput, handleInputSubmit]);
 
   if (!isOpen) return null;
   return (
-    <div className="fixed inset-0 bg-black bg-opacity-50 backdrop-blur-sm flex items-center justify-center p-6 z-50">
-      <div className="bg-white rounded-full shadow-2xl w-full max-w-6xl max-h-[90vh] flex flex-col">
+    <div className="fixed inset-0 bg-black bg-opacity-40 backdrop-blur-sm flex items-center justify-center p-2 sm:p-6 z-50">
+      <div className="bg-white rounded-3xl shadow-2xl w-full max-w-lg sm:max-w-3xl max-h-[95vh] flex flex-col overflow-hidden border border-gray-200">
         {/* Header */}
-        <div className="flex items-center justify-between p-6 border-b bg-gradient-to-r from-blue-500 via-purple-600 to-pink-600 rounded-t-xl">
+        <div className="flex items-center justify-between px-5 py-4 border-b bg-gradient-to-r from-blue-500 via-purple-600 to-pink-600 rounded-t-3xl">
           <div className="flex items-center space-x-4">
-            <div className="w-12 h-12 bg-white/20 rounded-full flex items-center justify-center">
+            <div className="w-12 h-12 bg-white/30 rounded-full flex items-center justify-center shadow-lg">
               {/* Example chat icon */}
               <svg
                 xmlns="http://www.w3.org/2000/svg"
@@ -296,8 +357,8 @@ ${userMessage}
               </svg>
             </div>
             <div>
-              <h2 className="text-2xl font-bold text-white">Chat with Tono</h2>
-              <p className="text-white/90">Your AI Travel Planning Expert</p>
+              <h2 className="text-2xl font-bold text-white drop-shadow">Chat with Tono</h2>
+              <p className="text-white/90 text-xs sm:text-sm">Your AI Travel Planning Expert</p>
             </div>
           </div>
           <button
@@ -325,7 +386,8 @@ ${userMessage}
         {/* Chat Body */}
         <div
           ref={chatRef}
-          className="flex-1 overflow-y-auto p-6 space-y-4 text-gray-900 bg-gray-50"
+          className="flex-1 overflow-y-auto px-3 sm:px-6 py-4 space-y-4 text-gray-900 bg-gradient-to-b from-gray-50 via-white to-gray-100"
+          style={{ scrollBehavior: "smooth" }}
         >
           {messages.map((msg, i) => {
             if (msg.type === "tripPlan") {
@@ -346,18 +408,41 @@ ${userMessage}
                 }`}
               >
                 <div
-                  className={`rounded-2xl px-4 py-2 text-base max-w-[70%] whitespace-pre-wrap border ${
+                  className={`rounded-2xl px-4 py-2 text-base max-w-[80vw] sm:max-w-[70%] whitespace-pre-wrap border relative transition-all duration-200 ${
                     msg.sender === "user"
-                      ? "bg-blue-600 text-white border-blue-700 rounded-br-none"
-                      : "bg-white border-gray-300 text-gray-800 rounded-bl-none shadow"
+                      ? "bg-blue-600 text-white border-blue-700 rounded-br-none shadow-lg"
+                      : "bg-white border-gray-300 text-gray-800 rounded-bl-none shadow-md"
                   }`}
                 >
                   {msg.sender === "bot" ? (
-                    <div
-                      dangerouslySetInnerHTML={{
-                        __html: marked.parse(msg.text || ""),
-                      }}
-                    />
+                    <>
+                      <div
+                        dangerouslySetInnerHTML={{
+                          __html: marked.parse(msg.text || ""),
+                        }}
+                      />
+                      {/* TTS button */}
+                      {msg.text && (
+                        <button
+                          onClick={() => speak(msg.text)}
+                          className="absolute -top-2 -right-2 bg-gray-200 text-gray-700 p-1 rounded-full shadow-md hover:bg-gray-300 transition-colors"
+                          aria-label="Read message aloud"
+                        >
+                          <svg
+                            xmlns="http://www.w3.org/2000/svg"
+                            className="h-4 w-4"
+                            viewBox="0 0 20 20"
+                            fill="currentColor"
+                          >
+                            <path
+                              fillRule="evenodd"
+                              d="M9.383 3.018a1.5 1.5 0 011.66 0l4.5 2.25A1.5 1.5 0 0116 6.643v6.714a1.5 1.5 0 01-1.457.76l-4.5-2.25a1.5 1.5 0 01-.826-1.34V4.358a1.5 1.5 0 01.826-1.34zM11 11.25V5.5L7 7.5v6l4-2z"
+                              clipRule="evenodd"
+                            />
+                          </svg>
+                        </button>
+                      )}
+                    </>
                   ) : (
                     msg.text
                   )}
@@ -370,36 +455,49 @@ ${userMessage}
         </div>
 
         {/* Input */}
-        {/* Chat input & buttons */}
-        <div className="border-t border-gray-300 bg-white rounded-b-3xl">
-          {/* Input + Send Button Row */}
-          <div className="p-4 flex items-center gap-3">
+        <div className="border-t border-gray-200 bg-white rounded-b-3xl">
+          <div className="px-3 sm:px-4 py-3 flex items-center gap-2 sm:gap-3">
             <input
               type="text"
               value={input}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && handleInputSubmit()}
               placeholder="Type your travel request..."
-              className="border border-gray-300 rounded-xl px-4 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 w-full"
+              className="border border-gray-300 rounded-xl px-4 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 w-full shadow-sm transition"
               disabled={loading}
             />
             <button
-              onClick={handleInputSubmit}
-              className="bg-blue-600 text-white rounded-xl px-5 py-2 text-sm hover:bg-blue-700 disabled:opacity-50 transition"
+              onClick={() => handleInputSubmit()}
+              className="bg-blue-600 text-white rounded-xl px-4 py-2 text-sm font-semibold hover:bg-blue-700 active:bg-blue-800 disabled:opacity-50 transition shadow"
               disabled={loading || !input.trim()}
+              type="button"
             >
-              Send
+              <span className="hidden sm:inline">Send</span>
+              <svg className="sm:hidden h-5 w-5" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" d="M5 12h14M12 5l7 7-7 7" />
+              </svg>
+            </button>
+            <button
+              onClick={handleMicClick}
+              className={`bg-gray-200 text-gray-700 rounded-full p-2 shadow hover:bg-gray-300 active:bg-gray-400 transition ${recording ? "animate-pulse ring-2 ring-blue-400" : ""}`}
+              aria-label="Speak your request"
+              type="button"
+              disabled={loading || recording}
+            >
+              {/* Improved mic SVG icon */}
+              <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="currentColor" viewBox="0 0 24 24">
+                <path d="M12 2a3 3 0 0 1 3 3v7a3 3 0 0 1-6 0V5a3 3 0 0 1 3-3zm5 10a1 1 0 1 1 2 0c0 4.418-3.582 8-8 8s-8-3.582-8-8a1 1 0 1 1 2 0c0 3.314 2.686 6 6 6s6-2.686 6-6zm-7 8h2v2a1 1 0 1 1-2 0v-2z"/>
+              </svg>
             </button>
           </div>
 
-          {/* Use Planning Form Button Row */}
-          <div className="px-4 pb-4">
+          <div className="px-3 sm:px-4 pb-4">
             <button
               onClick={() => {
-                if (onStartPlanning) onStartPlanning(); // go to planning step
-                if (onClose) onClose(); // close modal
+                if (onStartPlanning) onStartPlanning();
+                if (onClose) onClose();
               }}
-              className="bg-gradient-to-r from-pink-500 to-purple-600 text-white text-sm font-medium py-3 px-6 rounded-xl hover:shadow-lg hover:from-pink-600 hover:to-purple-700 transition-all duration-300"
+              className="w-full bg-gradient-to-r from-pink-500 to-purple-600 text-white text-sm font-semibold py-3 px-6 rounded-xl hover:shadow-lg hover:from-pink-600 hover:to-purple-700 transition-all duration-300 shadow"
             >
               Use Planning Form
             </button>
